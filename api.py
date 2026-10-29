@@ -23,6 +23,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from fraud_agents import (
+    PolicyAgent,
     behavior_agent,
     clear_velocity_cache,
     graph_agent,
@@ -107,7 +108,8 @@ WHERE account_id = :account_id
 # pipeline), the same treatment accounts without a profile got in training.
 PROFILE_SQL = text("""
 SELECT
-    CAST(NULLIF(TRIM(churn_risk_score), '') AS NUMERIC) AS churn_risk_score,
+    -- ::TEXT first: the column is TEXT when app.py creates it, DECIMAL in nigrani_prod_query.sql
+    CAST(NULLIF(TRIM(churn_risk_score::TEXT), '') AS NUMERIC) AS churn_risk_score,
     COALESCE(NULLIF(UPPER(TRIM(kyc_tier)), ''), 'UNKNOWN') AS kyc_tier,
     COALESCE(NULLIF(UPPER(TRIM(risk_tier)), ''), 'UNKNOWN') AS risk_tier,
     COALESCE(NULLIF(UPPER(TRIM(age_group)), ''), 'UNKNOWN') AS age_group
@@ -388,6 +390,7 @@ async def lifespan(app: FastAPI):
     try:
         app.state.redis_pool, app.state.redis = connect_redis(REDIS_URL)
         seed_baselines(app.state.redis)
+        app.state.policy_agent = PolicyAgent(app.state.redis)
     except Exception:
         app.state.engine.dispose()
         raise
@@ -452,6 +455,36 @@ def issue_token(form: OAuth2PasswordRequestForm = Depends()):
     )
 
 
+def persist_decision(engine, transaction_id: str, txn: TransactionRequest, user: dict, *,
+                     fraud_score: float, ml_decision: str, decision: str,
+                     flags: list[dict], shap_values: dict) -> int:
+    """Write the transaction and its verdict atomically and return transaction_ref.
+    A failed write is a 503: no verdict is returned that isn't on record."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(INSERT_TRANSACTION_SQL, {
+                "transaction_id": transaction_id,
+                "account_id": txn.account_id,
+                "amount": txn.amount,
+                "transaction_type": txn.transaction_type,
+                "transaction_channel": LIVE_CHANNEL,
+                "ip_address": inet_or_none(txn.ip_address),
+            })
+            return conn.execute(INSERT_DECISION_SQL, {
+                "transaction_id": transaction_id,
+                "submitted_by": user["username"],
+                "fraud_score": fraud_score,
+                "ml_decision": ml_decision,
+                "decision": decision,
+                "agent_flags": json.dumps(flags),
+                "shap_values": json.dumps(shap_values),
+                "payload": json.dumps(txn.model_dump()),
+            }).scalar_one()
+    except SQLAlchemyError:
+        log.exception("Persisting transaction %s failed", transaction_id)
+        raise HTTPException(status_code=503, detail="Transaction store unavailable")
+
+
 # Sync handler on purpose: FastAPI runs it in a threadpool, so the blocking
 # DB query and CPU-bound predict_proba/SHAP don't stall the event loop.
 @app.post("/api/v1/score-transaction", response_model=ScoreResponse)
@@ -465,14 +498,55 @@ def score_transaction(
         txn.hour_of_day = datetime.now().hour
     transaction_id = f"LIVE-{uuid.uuid4().hex}"
 
-    # Deterministic agents run first, so a burst is recorded in Redis even if
-    # PostgreSQL is down. Without Redis there is no velocity or behavior check:
-    # fail closed rather than score blind.
+    # Velocity first: every attempt lands in the account's Redis window before
+    # the Policy Agent can short-circuit, so probing the hard limit still
+    # builds toward a burst block. The Policy Agent's hard limit needs no
+    # state, so if Redis is down it still blocks; a PASS then fails closed below.
+    policy_agent = request.app.state.policy_agent
     try:
+        velocity = request.app.state.velocity_agent.evaluate(r, txn.account_id, transaction_id)
+        baseline = policy_agent.load_baseline(txn.account_id)
+        state_error = None
+    except redis.RedisError as exc:
+        log.warning("Agent state lookup failed for account %s: %s", txn.account_id, exc)
+        velocity, baseline, state_error = None, None, exc
+    policy = policy_agent.evaluate(txn.model_dump(), baseline)
+
+    # Short-circuit: a policy BLOCK is final. No model, SHAP or other agents
+    # (a velocity block already recorded is reported alongside it).
+    # ml_decision mirrors the block so the client renders it exactly like an
+    # ML-driven block; the policy_agent flag records that the model didn't run.
+    if policy.blocked:
+        fraud_score = round(policy.risk_score / 100, 4)    # 0-100 -> probability units
+        flags = [v.to_dict() for v in (policy.to_agent_verdict(), velocity) if v is not None]
+        ref = persist_decision(
+            request.app.state.engine, transaction_id, txn, user,
+            fraud_score=fraud_score, ml_decision="BLOCK", decision="BLOCK",
+            flags=flags, shap_values={},
+        )
+        log.info("user=%s account=%s policy BLOCK (%s); ML skipped",
+                 user["username"], txn.account_id, policy.reason)
+        return ScoreResponse(
+            transaction_ref=ref,
+            account_id=txn.account_id,
+            fraud_score=fraud_score,
+            decision="BLOCK",
+            ml_decision="BLOCK",
+            agent_flags=flags,
+            shap_values={},
+        )
+
+    # Without Redis there is no velocity or behavior check: fail closed rather
+    # than score blind. A velocity BLOCK carries on through the model so the
+    # analyst still gets a score and SHAP; most_restrictive keeps it a BLOCK.
+    try:
+        if state_error is not None:
+            raise state_error
         verdicts = [
-            request.app.state.velocity_agent.evaluate(r, txn.account_id, transaction_id),
+            velocity,
             sim_swap_agent(txn.account_id, txn.device_id),
-            behavior_agent.evaluate(r, txn.account_id, txn.amount, txn.hour_of_day, txn.district),
+            behavior_agent.evaluate(r, txn.account_id, txn.amount, txn.hour_of_day, txn.district,
+                                    baseline=baseline),
         ]
     except redis.RedisError:
         log.exception("Agent state lookup failed for account %s", txn.account_id)
@@ -539,31 +613,11 @@ def score_transaction(
 
     flags = [v.to_dict() for v in agent_flags]
 
-    # Persist the transaction and its verdict atomically: no verdict is
-    # returned that isn't on record.
-    try:
-        with request.app.state.engine.begin() as conn:
-            conn.execute(INSERT_TRANSACTION_SQL, {
-                "transaction_id": transaction_id,
-                "account_id": txn.account_id,
-                "amount": txn.amount,
-                "transaction_type": txn.transaction_type,
-                "transaction_channel": LIVE_CHANNEL,
-                "ip_address": inet_or_none(txn.ip_address),
-            })
-            ref = conn.execute(INSERT_DECISION_SQL, {
-                "transaction_id": transaction_id,
-                "submitted_by": user["username"],
-                "fraud_score": round(fraud_score, 4),
-                "ml_decision": ml_decision,
-                "decision": decision,
-                "agent_flags": json.dumps(flags),
-                "shap_values": json.dumps(shap_values),
-                "payload": json.dumps(txn.model_dump()),
-            }).scalar_one()
-    except SQLAlchemyError:
-        log.exception("Persisting transaction %s failed", transaction_id)
-        raise HTTPException(status_code=503, detail="Transaction store unavailable")
+    ref = persist_decision(
+        request.app.state.engine, transaction_id, txn, user,
+        fraud_score=round(fraud_score, 4), ml_decision=ml_decision, decision=decision,
+        flags=flags, shap_values=shap_values,
+    )
 
     return ScoreResponse(
         transaction_ref=ref,

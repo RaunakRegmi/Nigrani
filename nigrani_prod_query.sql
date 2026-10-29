@@ -114,18 +114,27 @@ FROM core.transactions;
 -- Ensure raw schema exists for batch ingestion and baselines
 CREATE SCHEMA IF NOT EXISTS raw;
 
+-- Raw Staging Tables (Append-only schema matching app.py)
+
 CREATE TABLE IF NOT EXISTS raw.customer_profiles (
-    account_id VARCHAR(50) PRIMARY KEY,
-    avg_tx_amount DECIMAL(15, 2),
-    home_region VARCHAR(100)
+    account_id VARCHAR(50),
+    churn_risk_score TEXT,
+    kyc_tier VARCHAR(20),
+    risk_tier VARCHAR(20),
+    age_group VARCHAR(20),
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_raw_cust_prof_acc ON raw.customer_profiles(account_id);
 
 CREATE TABLE IF NOT EXISTS raw.account_graph_nodes (
-    account_id VARCHAR(50) PRIMARY KEY,
-    degree_in INT DEFAULT 0,
-    degree_out INT DEFAULT 0,
-    risk_score DECIMAL(5,2) DEFAULT 0.00
+    id VARCHAR(50),
+    degree_in TEXT,
+    degree_out TEXT,
+    risk_score TEXT,
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_raw_graph_nodes_id ON raw.account_graph_nodes(id);
 
 -- Performance index for high-volume velocity lookups
 CREATE INDEX IF NOT EXISTS idx_core_tx_account_time 

@@ -105,7 +105,8 @@ SELECT
     v.txn_count_24h,
     v.total_amount_24h_npr,
     v.weekend_flag,
-    CAST(NULLIF(TRIM(p.churn_risk_score), '') AS NUMERIC) AS churn_risk_score,
+    -- ::TEXT first: the column is TEXT when app.py creates it, DECIMAL in nigrani_prod_query.sql
+    CAST(NULLIF(TRIM(p.churn_risk_score::TEXT), '') AS NUMERIC) AS churn_risk_score,
     COALESCE(CAST(NULLIF(TRIM(g.impossible_travel), '') AS BOOLEAN), FALSE) AS impossible_travel,
     COALESCE(CAST(NULLIF(TRIM(g.is_vpn), '') AS BOOLEAN), FALSE) AS is_vpn,
     COALESCE(CAST(NULLIF(TRIM(g.km_from_home_district), '') AS NUMERIC), 0) AS km_from_home_district,

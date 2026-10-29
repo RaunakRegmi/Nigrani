@@ -10,6 +10,7 @@ Redis client as a parameter (api.py owns the connection pool).
 """
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 
 import redis
 
@@ -183,8 +184,10 @@ class BehaviorAgent:
     name = "behavior_agent"
 
     def evaluate(self, r: redis.Redis, account_id: str, amount: float, hour_of_day: int,
-                 district: str | None) -> AgentVerdict | None:
-        baseline = load_baseline(r, account_id)
+                 district: str | None, baseline: dict | None = None) -> AgentVerdict | None:
+        # api.py passes the baseline it already fetched for the Policy Agent
+        if baseline is None:
+            baseline = load_baseline(r, account_id)
         if not baseline:
             return None
 
@@ -203,6 +206,94 @@ class BehaviorAgent:
 
 
 behavior_agent = BehaviorAgent()
+
+
+# Policy Agent: hard business rules evaluated before the ML model. A BLOCK here
+# is final, so api.py skips the model and every other agent.
+POLICY_HARD_LIMIT = 500_000
+POLICY_HARD_LIMIT_RISK = 99.9
+POLICY_OFF_HOURS = range(2, 5)         # 02:00-04:59
+POLICY_OFF_HOURS_RISK = 95.0
+_MISSING_LOCATIONS = {"", "unknown"}
+
+
+@dataclass(frozen=True)
+class PolicyVerdict:
+    decision: str            # "BLOCK" or "PASS"
+    risk_score: float        # 0-100
+    reason: str
+    detail: str = ""
+
+    @property
+    def blocked(self) -> bool:
+        return self.decision == "BLOCK"
+
+    def to_agent_verdict(self) -> AgentVerdict:
+        return AgentVerdict(PolicyAgent.name, self.decision, self.reason, self.detail)
+
+
+POLICY_PASS = PolicyVerdict("PASS", 0.0, "No policy rule violated")
+
+
+def _known_location(value) -> str | None:
+    """Normalized location, or None when it is missing or UNKNOWN."""
+    if not isinstance(value, str) or value.strip().lower() in _MISSING_LOCATIONS:
+        return None
+    return value.strip().lower()
+
+
+def _transaction_hour(data: dict) -> int | None:
+    """Hour from hour_of_day, else from an ISO timestamp; None if neither parses."""
+    hour = data.get("hour_of_day")
+    try:
+        if hour is not None and 0 <= int(hour) <= 23:
+            return int(hour)
+    except (TypeError, ValueError):
+        pass
+    ts = data.get("timestamp")
+    if isinstance(ts, datetime):
+        return ts.hour
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.strip().replace("Z", "+00:00")).hour
+        except ValueError:
+            pass
+    return None
+
+
+class PolicyAgent:
+    """Deterministic hard rules. Never raises on missing or malformed input: a
+    rule that can't be assessed doesn't fire."""
+
+    name = "policy_agent"
+
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+
+    def load_baseline(self, account_id: str) -> dict | None:
+        """The account's baseline from Redis (raises redis.RedisError if Redis is down)."""
+        return load_baseline(self.redis, account_id)
+
+    def evaluate(self, transaction_data: dict, user_baseline: dict | None) -> PolicyVerdict:
+        try:
+            amount = float(transaction_data.get("amount"))
+        except (TypeError, ValueError):
+            amount = None
+        if amount is not None and amount >= POLICY_HARD_LIMIT:
+            return PolicyVerdict(
+                "BLOCK", POLICY_HARD_LIMIT_RISK, "Hard limit exceeded",
+                f"amount {amount:,.2f} >= {POLICY_HARD_LIMIT:,}; ML model not run",
+            )
+
+        hour = _transaction_hour(transaction_data)
+        location = _known_location(transaction_data.get("district")) or _known_location(transaction_data.get("location"))
+        known = {d for d in map(_known_location, (user_baseline or {}).get("known_districts") or []) if d}
+        if hour is not None and hour in POLICY_OFF_HOURS and location and known and location not in known:
+            return PolicyVerdict(
+                "BLOCK", POLICY_OFF_HOURS_RISK, "Off-hours transaction in distant region",
+                f"{hour:02d}:00 in {location.title()}, outside known districts; ML model not run",
+            )
+        return POLICY_PASS
 
 
 def most_restrictive(decisions) -> str:
