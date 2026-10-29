@@ -9,6 +9,7 @@ shap==0.54.1
 SQLAlchemy==2.0.54
 psycopg2-binary==2.9.13
 python-dotenv==1.2.4
+redis==8.1.0               # velocity windows + behavior baselines
 
 # Modelling & analysis (train_engine.py, eda_hunter.py)
 pandas==3.0.6

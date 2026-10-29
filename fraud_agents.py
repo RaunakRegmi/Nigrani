@@ -3,11 +3,15 @@
 Each agent returns an AgentVerdict when it fires, or None when it has no
 objection. api.py combines the verdicts with the model's decision and keeps
 the most restrictive one.
+
+Stateful agents keep their state in Redis, not process memory, so every API
+worker and node sees the same velocity windows and baselines. They take the
+Redis client as a parameter (api.py owns the connection pool).
 """
-import threading
-import time
-from collections import defaultdict, deque
+import json
 from dataclasses import asdict, dataclass
+
+import redis
 
 # Most restrictive wins
 DECISION_SEVERITY = {"ALLOW": 0, "OTP": 1, "DUAL_OTP": 2, "BLOCK": 3}
@@ -40,37 +44,45 @@ class AgentVerdict:
         return asdict(self)
 
 
-class VelocityAgent:
-    """Sliding-window burst detector, in process memory.
+# Redis key layout. Every operation touches a single key, so this also works on Redis Cluster.
+KEY_PREFIX = "nigrani"
+VELOCITY_KEY = KEY_PREFIX + ":velocity:{account_id}"      # ZSET: member=txn id, score=epoch ms
+BASELINE_KEY = KEY_PREFIX + ":baseline:{account_id}"      # HASH: avg_amount, known_districts (JSON)
 
-    Thread-safe (FastAPI runs sync endpoints in a threadpool). State is per
-    process: with several uvicorn workers each keeps its own window, and a
-    restart clears it.
-    """
+# Atomic sliding window on the Redis server clock: one clock for every worker,
+# and no read-modify-write race between concurrent requests for one account.
+# Keeps events with ts >= now - window (same boundary as before), then lets an
+# idle account's key expire on its own.
+_VELOCITY_LUA = """
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local window_ms = tonumber(ARGV[1])
+redis.call('ZADD', KEYS[1], now_ms, ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', '(' .. (now_ms - window_ms))
+redis.call('PEXPIRE', KEYS[1], window_ms)
+return redis.call('ZCARD', KEYS[1])
+"""
+
+
+class VelocityAgent:
+    """Sliding-window burst detector backed by a Redis sorted set per account."""
 
     name = "velocity_agent"
 
-    def __init__(self, window_s=VELOCITY_WINDOW_S, max_txns=VELOCITY_MAX_TXNS, clock=time.monotonic):
+    def __init__(self, window_s=VELOCITY_WINDOW_S, max_txns=VELOCITY_MAX_TXNS):
         self.window_s = window_s
         self.max_txns = max_txns
-        self.clock = clock
-        self._events: dict[str, deque] = defaultdict(deque)
-        self._lock = threading.Lock()
-        self._calls = 0
 
-    def evaluate(self, account_id: str) -> AgentVerdict | None:
-        now = self.clock()
-        with self._lock:
-            window = self._events[account_id]
-            window.append(now)
-            self._expire(window, now)
-            count = len(window)
+    def evaluate(self, r: redis.Redis, account_id: str, event_id: str) -> AgentVerdict | None:
+        """Record one transaction (event_id must be unique) and check the window.
 
-            # Periodically drop idle accounts so memory stays bounded
-            self._calls += 1
-            if self._calls % 1000 == 0:
-                self._sweep(now)
-
+        Raises redis.RedisError when Redis is unreachable; the caller decides
+        whether to fail closed.
+        """
+        count = int(r.eval(
+            _VELOCITY_LUA, 1, VELOCITY_KEY.format(account_id=account_id),
+            int(self.window_s * 1000), event_id,
+        ))
         if count > self.max_txns:
             return AgentVerdict(
                 self.name, "BLOCK", "Velocity Burst",
@@ -78,29 +90,27 @@ class VelocityAgent:
             )
         return None
 
-    def _expire(self, window: deque, now: float):
-        while window and now - window[0] > self.window_s:
-            window.popleft()
-
-    def _sweep(self, now: float):
-        for account_id in list(self._events):
-            window = self._events[account_id]
-            self._expire(window, now)
-            if not window:
-                del self._events[account_id]
-
-    def reset(self):
-        with self._lock:
-            self._events.clear()
+    def reset(self, r: redis.Redis) -> int:
+        """Delete every account's window. Returns the number of keys removed."""
+        removed = 0
+        batch = []
+        for key in r.scan_iter(match=VELOCITY_KEY.format(account_id="*"), count=1000):
+            batch.append(key)
+            if len(batch) >= 1000:
+                removed += r.unlink(*batch)
+                batch.clear()
+        if batch:
+            removed += r.unlink(*batch)
+        return removed
 
 
-# Process-wide instance used by api.py, so the cache can be cleared from here
+# Shared instance used by api.py. It holds config only; state lives in Redis.
 velocity_agent = VelocityAgent()
 
 
-def clear_velocity_cache():
-    """Drop every account's velocity timestamps (testing/ops utility)."""
-    velocity_agent.reset()
+def clear_velocity_cache(r: redis.Redis) -> int:
+    """Drop every account's velocity window (testing/ops utility)."""
+    return velocity_agent.reset(r)
 
 
 def graph_agent(degree_in: float, amount: float) -> AgentVerdict | None:
@@ -122,8 +132,9 @@ def sim_swap_agent(account_id: str, device_id: str, trusted_devices=TRUSTED_DEVI
     return None
 
 
-# Behavior (UEBA) Agent: mock per-account baselines. Accounts without a
-# baseline are not evaluated, same as the SIM Swap Agent.
+# Behavior (UEBA) Agent. Baselines live in Redis hashes; these mock profiles
+# seed Redis at startup (seed_baselines) and never overwrite a stored value.
+# Accounts without a baseline are not evaluated, same as the SIM Swap Agent.
 mock_user_baselines = {
     "ACC-8622639": {"avg_amount": 4000, "known_districts": ["Kathmandu", "Lalitpur"]},
     "ACC-2522726": {"avg_amount": 8000, "known_districts": ["Lalitpur"]},
@@ -131,6 +142,34 @@ mock_user_baselines = {
 BEHAVIOR_AMOUNT_MULTIPLIER = 5
 BEHAVIOR_NIGHT_HOURS = range(0, 6)     # 00:00-05:59
 BEHAVIOR_MIN_ANOMALIES = 2
+
+
+def save_baseline(r: redis.Redis, account_id: str, avg_amount: float, known_districts: list[str], overwrite=True):
+    key = BASELINE_KEY.format(account_id=account_id)
+    fields = {"avg_amount": str(avg_amount), "known_districts": json.dumps(known_districts)}
+    if overwrite:
+        r.hset(key, mapping=fields)
+    else:
+        with r.pipeline() as pipe:
+            for field, value in fields.items():
+                pipe.hsetnx(key, field, value)
+            pipe.execute()
+
+
+def load_baseline(r: redis.Redis, account_id: str) -> dict | None:
+    raw = r.hgetall(BASELINE_KEY.format(account_id=account_id))
+    if not raw or "avg_amount" not in raw:
+        return None
+    return {
+        "avg_amount": float(raw["avg_amount"]),
+        "known_districts": json.loads(raw.get("known_districts") or "[]"),
+    }
+
+
+def seed_baselines(r: redis.Redis, baselines=mock_user_baselines):
+    """Write the mock baselines without clobbering anything already in Redis."""
+    for account_id, b in baselines.items():
+        save_baseline(r, account_id, b["avg_amount"], b["known_districts"], overwrite=False)
 
 
 class BehaviorAgent:
@@ -143,11 +182,9 @@ class BehaviorAgent:
 
     name = "behavior_agent"
 
-    def __init__(self, baselines=mock_user_baselines):
-        self.baselines = baselines
-
-    def evaluate(self, account_id: str, amount: float, hour_of_day: int, district: str | None) -> AgentVerdict | None:
-        baseline = self.baselines.get(account_id)
+    def evaluate(self, r: redis.Redis, account_id: str, amount: float, hour_of_day: int,
+                 district: str | None) -> AgentVerdict | None:
+        baseline = load_baseline(r, account_id)
         if not baseline:
             return None
 

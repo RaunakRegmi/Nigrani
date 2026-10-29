@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: nigrani_api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://nigrani_admin:nigrani_secure_pass@db:5432/nigrani_core
+      - REDIS_URL=redis://redis:6379/0
+      - ENVIRONMENT=development
+    volumes:
+      - .:/app # Live code reload
+      - ./frozen_model.pkl:/app/frozen_model.pkl:ro # Read-only ML model
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+
+  db:
+    image: postgres:15-alpine
+    container_name: nigrani_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=nigrani_admin
+      - POSTGRES_PASSWORD=nigrani_secure_pass
+      - POSTGRES_DB=nigrani_core
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Automatically execute the DDL script on first boot to create tables
+      - ./nigrani_prod_query.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nigrani_admin -d nigrani_core"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nigrani_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+volumes:
+  postgres_data:
+  redis_data:

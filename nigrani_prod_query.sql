@@ -45,6 +45,23 @@ CREATE TABLE core.transactions (
     is_fraud BOOLEAN DEFAULT FALSE
 );
 
+-- Verdicts for transactions scored live by api.py (1:1 with core.transactions).
+-- Live rows go into core.transactions with transaction_channel 'NIGRANI_API'
+-- and is_fraud NULL until a fraud_labels upload labels them.
+CREATE TABLE core.transaction_decisions (
+    transaction_ref BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    transaction_id VARCHAR(64) NOT NULL UNIQUE
+        REFERENCES core.transactions (transaction_id) ON DELETE CASCADE,
+    scored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    submitted_by VARCHAR(64) NOT NULL,
+    fraud_score NUMERIC(6,4) NOT NULL,
+    ml_decision VARCHAR(16) NOT NULL,
+    decision VARCHAR(16) NOT NULL,
+    agent_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
+    shap_values JSONB NOT NULL DEFAULT '{}'::jsonb,
+    payload JSONB NOT NULL
+);
+
 -- 4. FEATURE ENGINE VIEWS
 
 -- A. Velocity Feature View
@@ -93,3 +110,23 @@ SELECT
         )
     )) / 60 AS prev_txn_time_delta_min
 FROM core.transactions;
+
+-- Ensure raw schema exists for batch ingestion and baselines
+CREATE SCHEMA IF NOT EXISTS raw;
+
+CREATE TABLE IF NOT EXISTS raw.customer_profiles (
+    account_id VARCHAR(50) PRIMARY KEY,
+    avg_tx_amount DECIMAL(15, 2),
+    home_region VARCHAR(100)
+);
+
+CREATE TABLE IF NOT EXISTS raw.account_graph_nodes (
+    account_id VARCHAR(50) PRIMARY KEY,
+    degree_in INT DEFAULT 0,
+    degree_out INT DEFAULT 0,
+    risk_score DECIMAL(5,2) DEFAULT 0.00
+);
+
+-- Performance index for high-volume velocity lookups
+CREATE INDEX IF NOT EXISTS idx_core_tx_account_time 
+ON core.transactions (account_id, transaction_timestamp);

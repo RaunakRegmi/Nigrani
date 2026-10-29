@@ -1,17 +1,19 @@
+import ipaddress
+import json
 import logging
 import os
 import secrets
 import threading
 import time
-from collections import deque
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from itertools import count
 
 import joblib
 import jwt
 import numpy as np
 import pandas as pd
+import redis
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,13 +27,16 @@ from fraud_agents import (
     clear_velocity_cache,
     graph_agent,
     most_restrictive,
+    seed_baselines,
     sim_swap_agent,
     velocity_agent,
 )
 
-# Load DATABASE_URL from .env (never hardcode credentials)
+# Load DATABASE_URL / REDIS_URL from .env (never hardcode credentials).
+# Real environment variables (e.g. from docker-compose) take precedence.
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
 MODEL_PATH = os.getenv("MODEL_PATH", "frozen_model.pkl")
 
 # JWT signing key. Without NIGRANI_JWT_SECRET a random key is generated per
@@ -52,6 +57,10 @@ SHAP_APPROXIMATE = os.getenv("NIGRANI_SHAP_MODE", "exact").lower() == "approx"
 SHAP_TOP_N = 3
 
 HISTORY_SIZE = 50
+
+# Live API transactions are written to core.transactions with this channel,
+# so analysts and training queries can tell them apart from bank extracts.
+LIVE_CHANNEL = "NIGRANI_API"
 
 # Must match train_engine.py exactly
 FEATURES = [
@@ -122,10 +131,76 @@ LIMIT 1
 """)
 NO_GRAPH_NODE = {"degree_in": 0, "degree_out": 0}
 
+# Verdicts for live transactions. core.transactions has no columns for them,
+# so they sit in a 1:1 companion table (also defined in nigrani_prod_query.sql;
+# created here too so an existing database picks it up without a reset).
+DECISIONS_DDL = text("""
+CREATE TABLE IF NOT EXISTS core.transaction_decisions (
+    transaction_ref BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    transaction_id VARCHAR(64) NOT NULL UNIQUE
+        REFERENCES core.transactions (transaction_id) ON DELETE CASCADE,
+    scored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    submitted_by VARCHAR(64) NOT NULL,
+    fraud_score NUMERIC(6,4) NOT NULL,
+    ml_decision VARCHAR(16) NOT NULL,
+    decision VARCHAR(16) NOT NULL,
+    agent_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
+    shap_values JSONB NOT NULL DEFAULT '{}'::jsonb,
+    payload JSONB NOT NULL
+)
+""")
+
+# Same normalization as the CSV transform in app.py. LOCALTIMESTAMP keeps the
+# database clock and naive TIMESTAMP type VELOCITY_SQL measures against.
+# is_fraud stays NULL (unlabeled) so train_engine.py skips the row until a
+# fraud_labels upload labels it, instead of learning it as a negative.
+INSERT_TRANSACTION_SQL = text("""
+INSERT INTO core.transactions (
+    transaction_id,
+    transaction_timestamp,
+    account_id,
+    amount,
+    transaction_type,
+    transaction_channel,
+    ip_address,
+    is_fraud
+)
+VALUES (
+    :transaction_id,
+    LOCALTIMESTAMP,
+    TRIM(:account_id),
+    CAST(:amount AS NUMERIC(15,2)),
+    UPPER(TRIM(:transaction_type)),
+    :transaction_channel,
+    CAST(:ip_address AS INET),
+    NULL
+)
+""")
+
+INSERT_DECISION_SQL = text("""
+INSERT INTO core.transaction_decisions (
+    transaction_id, submitted_by, fraud_score, ml_decision, decision,
+    agent_flags, shap_values, payload
+)
+VALUES (
+    :transaction_id, :submitted_by, :fraud_score, :ml_decision, :decision,
+    CAST(:agent_flags AS JSONB), CAST(:shap_values AS JSONB), CAST(:payload AS JSONB)
+)
+RETURNING transaction_ref
+""")
+
+LIVE_TRANSACTIONS_SQL = text("""
+SELECT transaction_ref, scored_at, submitted_by, payload, fraud_score,
+       ml_decision, decision, agent_flags, shap_values
+FROM core.transaction_decisions
+ORDER BY transaction_ref DESC
+LIMIT :limit
+""")
+
 
 class TransactionRequest(BaseModel):
     account_id: str = Field(..., min_length=1, max_length=64)
-    amount: float = Field(..., gt=0)
+    amount: float = Field(..., gt=0, lt=10**13)    # fits core.transactions NUMERIC(15,2)
     transaction_type: str = Field(..., min_length=1, max_length=32)
     ip_address: str = Field(..., min_length=1, max_length=45)
     # Live geo telemetry from the caller. A live transaction has no row in
@@ -240,30 +315,43 @@ class ShapExplainer:
         return {feature: round(float(v), 4) for feature, v in top.items()}
 
 
-# ---------------------------------------------------------------- live history
+# ---------------------------------------------------------------- connections
 
-class TransactionHistory:
-    """Last N scored transactions, newest first. In process memory: per worker,
-    cleared on restart."""
-
-    def __init__(self, maxlen=HISTORY_SIZE):
-        self._items = deque(maxlen=maxlen)
-        self._ids = count(1)
-        self._lock = threading.Lock()
-
-    def next_id(self) -> int:
-        return next(self._ids)
-
-    def append(self, record: dict):
-        with self._lock:
-            self._items.appendleft(record)
-
-    def snapshot(self) -> list[dict]:
-        with self._lock:
-            return list(self._items)
+def get_redis(request: Request) -> redis.Redis:
+    return request.app.state.redis
 
 
-transaction_history = TransactionHistory()
+def connect_redis(url: str, attempts: int = 5) -> tuple[redis.ConnectionPool, redis.Redis]:
+    """Open the shared pool and wait briefly for Redis (compose starts it in parallel)."""
+    pool = redis.ConnectionPool.from_url(
+        url,
+        decode_responses=True,
+        # Fail fast: a hung Redis must turn into a 503, not a stuck request
+        socket_connect_timeout=2,
+        socket_timeout=2,
+        health_check_interval=30,
+        max_connections=50,
+    )
+    client = redis.Redis(connection_pool=pool)
+    for attempt in range(1, attempts + 1):
+        try:
+            client.ping()
+            return pool, client
+        except redis.RedisError as exc:
+            if attempt == attempts:
+                pool.disconnect()
+                raise RuntimeError(f"Redis unreachable at startup: {exc}") from exc
+            log.warning("Redis not ready (attempt %d/%d): %s", attempt, attempts, exc)
+            time.sleep(1)
+
+
+def inet_or_none(value: str) -> str | None:
+    """core.transactions.ip_address is INET: store an unparseable address as NULL
+    rather than rejecting a payload the API has always accepted."""
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- app
@@ -271,7 +359,9 @@ transaction_history = TransactionHistory()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set. Add it to a .env file next to api.py.")
+        raise RuntimeError("DATABASE_URL is not set. Add it to the environment or a .env file.")
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL is not set. Add it to the environment or a .env file.")
 
     # Fail fast: refuse to start without a model that matches the feature contract
     model = joblib.load(MODEL_PATH)
@@ -281,8 +371,27 @@ async def lifespan(app: FastAPI):
 
     app.state.model = model
     app.state.velocity_agent = velocity_agent
-    app.state.engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10)
     log.info("Loaded %s (%s)", MODEL_PATH, type(model).__name__)
+
+    app.state.engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=10)
+    try:
+        with app.state.engine.begin() as conn:
+            # Concurrent CREATE TABLE IF NOT EXISTS can still collide when
+            # several workers boot at once; serialize it.
+            conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('nigrani.transaction_decisions'))"))
+            conn.execute(DECISIONS_DDL)
+    except SQLAlchemyError as exc:
+        app.state.engine.dispose()
+        raise RuntimeError(f"PostgreSQL unavailable or core schema missing: {exc}") from exc
+    log.info("PostgreSQL ready")
+
+    try:
+        app.state.redis_pool, app.state.redis = connect_redis(REDIS_URL)
+        seed_baselines(app.state.redis)
+    except Exception:
+        app.state.engine.dispose()
+        raise
+    log.info("Redis ready")
 
     # Explainability is best-effort: scoring must keep working without it
     try:
@@ -294,8 +403,13 @@ async def lifespan(app: FastAPI):
 
     if not os.getenv("NIGRANI_JWT_SECRET"):
         log.warning("NIGRANI_JWT_SECRET not set: using a random key, tokens expire on restart")
-    yield
-    app.state.engine.dispose()
+    try:
+        yield
+    finally:
+        app.state.redis.close()
+        app.state.redis_pool.disconnect()
+        app.state.engine.dispose()
+        log.info("Connections closed")
 
 
 app = FastAPI(title="NIGRANI Fraud Scoring API", version="2.0.0", lifespan=lifespan)
@@ -345,17 +459,24 @@ def score_transaction(
     txn: TransactionRequest,
     request: Request,
     user: dict = Depends(require_role("wallet", "admin")),
+    r: redis.Redis = Depends(get_redis),
 ):
     if txn.hour_of_day is None:
         txn.hour_of_day = datetime.now().hour
+    transaction_id = f"LIVE-{uuid.uuid4().hex}"
 
-    # Deterministic agents run first. Velocity, SIM swap and behavior need no
-    # DB, so a burst is still recorded even if the feature store is down.
-    verdicts = [
-        request.app.state.velocity_agent.evaluate(txn.account_id),
-        sim_swap_agent(txn.account_id, txn.device_id),
-        behavior_agent.evaluate(txn.account_id, txn.amount, txn.hour_of_day, txn.district),
-    ]
+    # Deterministic agents run first, so a burst is recorded in Redis even if
+    # PostgreSQL is down. Without Redis there is no velocity or behavior check:
+    # fail closed rather than score blind.
+    try:
+        verdicts = [
+            request.app.state.velocity_agent.evaluate(r, txn.account_id, transaction_id),
+            sim_swap_agent(txn.account_id, txn.device_id),
+            behavior_agent.evaluate(r, txn.account_id, txn.amount, txn.hour_of_day, txn.district),
+        ]
+    except redis.RedisError:
+        log.exception("Agent state lookup failed for account %s", txn.account_id)
+        raise HTTPException(status_code=503, detail="Agent state store unavailable")
 
     try:
         with request.app.state.engine.connect() as conn:
@@ -371,8 +492,8 @@ def score_transaction(
     verdicts.append(graph_agent(float(node["degree_in"]), txn.amount))
     agent_flags = [v for v in verdicts if v is not None]
 
-    # Training windows include the current transaction (RANGE ... CURRENT ROW),
-    # so fold the live transaction into the history the same way.
+    # Training windows include the current transaction (RANGE ... CURRENT ROW).
+    # It isn't stored yet (it's written below, after scoring), so fold it in.
     features = pd.DataFrame(
         [{
             "amount": txn.amount,
@@ -416,19 +537,33 @@ def score_transaction(
         [v.agent for v in agent_flags] or "-",
     )
 
-    ref = transaction_history.next_id()
     flags = [v.to_dict() for v in agent_flags]
-    transaction_history.append({
-        "transaction_ref": ref,
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "submitted_by": user["username"],
-        "payload": txn.model_dump(),
-        "fraud_score": round(fraud_score, 4),
-        "ml_decision": ml_decision,
-        "decision": decision,
-        "agent_flags": flags,
-        "shap_values": shap_values,
-    })
+
+    # Persist the transaction and its verdict atomically: no verdict is
+    # returned that isn't on record.
+    try:
+        with request.app.state.engine.begin() as conn:
+            conn.execute(INSERT_TRANSACTION_SQL, {
+                "transaction_id": transaction_id,
+                "account_id": txn.account_id,
+                "amount": txn.amount,
+                "transaction_type": txn.transaction_type,
+                "transaction_channel": LIVE_CHANNEL,
+                "ip_address": inet_or_none(txn.ip_address),
+            })
+            ref = conn.execute(INSERT_DECISION_SQL, {
+                "transaction_id": transaction_id,
+                "submitted_by": user["username"],
+                "fraud_score": round(fraud_score, 4),
+                "ml_decision": ml_decision,
+                "decision": decision,
+                "agent_flags": json.dumps(flags),
+                "shap_values": json.dumps(shap_values),
+                "payload": json.dumps(txn.model_dump()),
+            }).scalar_one()
+    except SQLAlchemyError:
+        log.exception("Persisting transaction %s failed", transaction_id)
+        raise HTTPException(status_code=503, detail="Transaction store unavailable")
 
     return ScoreResponse(
         transaction_ref=ref,
@@ -442,15 +577,39 @@ def score_transaction(
 
 
 @app.get("/api/v1/live-transactions")
-def live_transactions(user: dict = Depends(require_role("admin"))):
-    return transaction_history.snapshot()
+def live_transactions(request: Request, user: dict = Depends(require_role("admin"))):
+    try:
+        with request.app.state.engine.connect() as conn:
+            rows = conn.execute(LIVE_TRANSACTIONS_SQL, {"limit": HISTORY_SIZE}).mappings().all()
+    except SQLAlchemyError:
+        log.exception("Live transaction feed query failed")
+        raise HTTPException(status_code=503, detail="Transaction store unavailable")
+    # Same shape the in-memory feed had, newest first
+    return [
+        {
+            "transaction_ref": row["transaction_ref"],
+            "timestamp": row["scored_at"].astimezone(timezone.utc).isoformat(timespec="seconds"),
+            "submitted_by": row["submitted_by"],
+            "payload": row["payload"],
+            "fraud_score": float(row["fraud_score"]),
+            "ml_decision": row["ml_decision"],
+            "decision": row["decision"],
+            "agent_flags": row["agent_flags"],
+            "shap_values": row["shap_values"],
+        }
+        for row in rows
+    ]
 
 
 @app.post("/api/v1/clear-cache")
-def clear_cache(request: Request, user: dict = Depends(require_role("admin"))):
-    clear_velocity_cache()
-    log.warning("Velocity cache cleared by %s from %s", user["username"],
-                request.client.host if request.client else "unknown")
+def clear_cache(request: Request, user: dict = Depends(require_role("admin")), r: redis.Redis = Depends(get_redis)):
+    try:
+        removed = clear_velocity_cache(r)
+    except redis.RedisError:
+        log.exception("Velocity cache clear failed")
+        raise HTTPException(status_code=503, detail="Agent state store unavailable")
+    log.warning("Velocity cache cleared by %s from %s (%d accounts)", user["username"],
+                request.client.host if request.client else "unknown", removed)
     return {"status": "success", "message": "Velocity cache cleared"}
 
 

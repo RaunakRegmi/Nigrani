@@ -1,0 +1,11 @@
+# Keep secrets, local environments and the frontend out of the API image
+.env
+.env.*
+venv/
+.venv/
+.git/
+__pycache__/
+*.py[cod]
+nigrani-client/
+*.log
+.DS_Store
