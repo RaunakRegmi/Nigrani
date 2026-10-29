@@ -1,0 +1,9 @@
+.env
+venv/
+__pycache__/
+.DS_Store
+frozen_model.pkl
+frozen_model.pkl
+frozen_model.pkl
+frozen_model.pkl
+frozen_model.pkl
