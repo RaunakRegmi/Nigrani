@@ -1,0 +1,21 @@
+# Scoring API (api.py, fraud_agents.py)
+fastapi==0.162.0
+uvicorn==0.53.0
+python-multipart==0.0.32   # OAuth2 form login on /token
+PyJWT==2.15.1
+shap==0.54.1
+
+# Data access
+SQLAlchemy==2.0.54
+psycopg2-binary==2.9.13
+python-dotenv==1.2.4
+
+# Modelling & analysis (train_engine.py, eda_hunter.py)
+pandas==3.0.6
+numpy==2.5.3
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+
+# CSV ingestion router (app.py)
+streamlit==1.64.0
